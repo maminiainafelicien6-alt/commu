@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Voice Chat - HTML</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; background:#f3f4f6; margin:0; padding:24px; }
+    .card { background:white; border-radius:12px; padding:18px; box-shadow:0 6px 18px rgba(0,0,0,0.08); max-width:900px; margin:0 auto; }
+    .row { display:flex; gap:12px; align-items:center; }
+    input, button { font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #ddd; }
+    button.primary { background:#2563eb; color:white; border:none; }
+    .participants { margin-top:12px; }
+    .participant { display:flex; justify-content:space-between; padding:8px; border-radius:8px; border:1px solid #eee; margin-bottom:8px; background:#fafafa; }
+    small { color:#6b7280; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Voice chat (HTML)</h2>
+    <div id="setup" class="setup">
+      <div style="margin-bottom:8px;">
+        <label>Pseudo : </label>
+        <input id="username" placeholder="Ton pseudo..." />
+      </div>
+      <div class="row" style="margin-bottom:10px;">
+        <button id="joinBtn" class="primary">Rejoindre</button>
+        <button id="testMic">Tester Micro</button>
+        <label style="margin-left:12px;"><input type="checkbox" id="ptt" /> Push-to-talk (Espace)</label>
+      </div>
+      <div><small>Le micro doit être autorisé. Le signaling server doit tourner (Socket.IO).</small></div>
+    </div>
+
+    <div id="room" style="display:none;">
+      <div class="row" style="justify-content:space-between; margin-bottom:8px;">
+        <div>
+          Connecté comme <strong id="meName"></strong>
+          <div><small id="roomInfo">Salon: main</small></div>
+        </div>
+        <div class="row">
+          <button id="muteBtn">Couper mic</button>
+          <button id="leaveBtn">Quitter</button>
+        </div>
+      </div>
+
+      <div class="row" style="gap:20px;">
+        <div style="flex:1;">
+          <h4>Participants</h4>
+          <div id="participants" class="participants"></div>
+        </div>
+
+        <div style="width:320px;">
+          <h4>Contrôles</h4>
+          <div><small id="pttState">PTT: désactivé</small></div>
+          <div style="margin-top:8px;"><small id="micState">Micro: N/A</small></div>
+        </div>
+      </div>
+
+      <!-- container for remote audio elements -->
+      <div id="remoteAudio" style="margin-top:12px;"></div>
+      <!-- hidden local audio (optional) -->
+      <audio id="localAudio" autoplay muted style="display:none"></audio>
+    </div>
+  </div>
+
+  <!-- Socket.IO client -->
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  <!-- simple-peer -->
+  <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
+
+  <script>
+    (function(){
+      const SIGNALING_SERVER = "http://localhost:3000"; // change si nécessaire
+      const ROOM = "main";
+
+      const usernameInput = document.getElementById('username');
+      const joinBtn = document.getElementById('joinBtn');
+      const testMicBtn = document.getElementById('testMic');
+      const pttCheckbox = document.getElementById('ptt');
+
+      const setupDiv = document.getElementById('setup');
+      const roomDiv = document.getElementById('room');
+      const meNameSpan = document.getElementById('meName');
+      const participantsDiv = document.getElementById('participants');
+      const remoteAudio = document.getElementById('remoteAudio');
+      const localAudio = document.getElementById('localAudio');
+      const muteBtn = document.getElementById('muteBtn');
+      const leaveBtn = document.getElementById('leaveBtn');
+      const pttState = document.getElementById('pttState');
+      const micState = document.getElementById('micState');
+
+      let socket = null;
+      let localStream = null;
+      let peers = {}; // socketId -> SimplePeer instance
+      let myId = null;
+      let muted = false;
+      let ptt = false;
+
+      async function startLocal() {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          localAudio.srcObject = localStream;
+          micState.textContent = "Micro: autorisé";
+          // start muted by default
+          setLocalMuted(true);
+        } catch (err) {
+          console.error("Micro non autorisé", err);
+          alert("Erreur: accès micro refusé.");
+          throw err;
+        }
+      }
+
+      function setLocalMuted(m) {
+        if (!localStream) return;
+        localStream.getAudioTracks().forEach(t => t.enabled = !m);
+        muted = m;
+        muteBtn.textContent = m ? "Activer mic" : "Couper mic";
+        micState.textContent = "Micro: " + (m ? "coupé" : "actif");
+      }
+
+      function createAudioEl(id, label) {
+        let el = document.getElementById('audio-' + id);
+        if (!el) {
+          el = document.createElement('audio');
+          el.id = 'audio-' + id;
+          el.autoplay = true;
+          el.controls = true;
+          el.style.display = 'block';
+          el.style.marginBottom = '8px';
+          el.title = label;
+          remoteAudio.appendChild(el);
+        }
+        return el;
+      }
+
+      function removeAudioEl(id) {
+        const el = document.getElementById('audio-' + id);
+        if (el) el.remove();
+      }
+
+      async function join() {
+        const name = usernameInput.value.trim();
+        if (!name) return alert("Choisis un pseudo.");
+        await startLocal();
+
+        socket = io(SIGNALING_SERVER, { transports: ['websocket'] });
+
+        socket.on('connect', () => {
+          myId = socket.id;
+          socket.emit('join-room', { room: ROOM, username: name });
+        });
+
+        socket.on('room-users', ({ users }) => {
+          // users includes the new user too per server example
+          participantsDiv.innerHTML = '';
+          users.forEach(u => {
+            if (u.id === socket.id) {
+              meNameSpan.textContent = name + " (toi)";
+            }
+            addParticipant(u.id, u.username);
+            // if other than me, create initiator peer to them
+            if (u.id !== socket.id) createPeer(u.id, true, u.username);
+          });
+        });
+
+        socket.on('user-joined', ({ id, username }) => {
+          addParticipant(id, username);
+          createPeer(id, false, username);
+        });
+
+        socket.on('signal', ({ from, data }) => {
+          if (peers[from] && peers[from].peer) {
+            peers[from].peer.signal(data);
+          }
+        });
+
+        socket.on('user-left', ({ id }) => {
+          removeParticipant(id);
+          if (peers[id]) {
+            try { peers[id].peer.destroy(); } catch(e) {}
+            delete peers[id];
+          }
+          removeAudioEl(id);
+        });
+
+        setupDiv.style.display = 'none';
+        roomDiv.style.display = 'block';
+        ptt = pttCheckbox.checked;
+        pttState.textContent = 'PTT: ' + (ptt ? 'activé (appuie sur Espace)' : 'désactivé');
+      }
+
+      function addParticipant(id, username) {
+        const div = document.createElement('div');
+        div.className = 'participant';
+        div.id = 'part-' + id;
+        const left = document.createElement('div');
+        left.innerHTML = '<strong>' + (username || 'Anon') + '</strong><div><small>' + (id === myId ? '(toi)' : id) + '</small></div>';
+        const right = document.createElement('div');
+        const btn = document.createElement('button');
+        btn.textContent = 'Mute';
+        btn.onclick = () => {
+          const audioEl = document.getElementById('audio-' + id);
+          if (!audioEl) return alert("Aucun flux audio reçu.");
+          audioEl.muted = !audioEl.muted;
+          btn.textContent = audioEl.muted ? 'Unmute' : 'Mute';
+        };
+        right.appendChild(btn);
+        div.appendChild(left);
+        div.appendChild(right);
+        participantsDiv.appendChild(div);
+      }
+
+      function removeParticipant(id) {
+        const el = document.getElementById('part-' + id);
+        if (el) el.remove();
+      }
+
+      function createPeer(socketId, initiator, username) {
+        if (!localStream) return;
+        const peer = new SimplePeer({ initiator, trickle: true, stream: localStream });
+        peers[socketId] = { peer, username };
+
+        peer.on('signal', data => {
+          socket.emit('signal', { to: socketId, data });
+        });
+
+        peer.on('stream', remoteStream => {
+          const audioEl = createAudioEl(socketId, username || socketId);
+          audioEl.srcObject = remoteStream;
+        });
+
+        peer.on('close', () => {
+          removeAudioEl(socketId);
+          if (peers[socketId]) delete peers[socketId];
+        });
+
+        peer.on('error', (err) => console.warn('peer error', err));
+      }
+
+      // events
+      joinBtn.addEventListener('click', join);
+      testMicBtn.addEventListener('click', async () => {
+        try {
+          await startLocal();
+          setLocalMuted(true);
+          alert('Micro testé (en muet). Clique Rejoindre pour te connecter.');
+        } catch(e) {}
+      });
+
+      muteBtn.addEventListener('click', () => setLocalMuted(!muted));
+      leaveBtn.addEventListener('click', () => {
+        if (socket) socket.disconnect();
+        Object.values(peers).forEach(p => p.peer && p.peer.destroy());
+        peers = {};
+        localStream && localStream.getTracks().forEach(t => t.stop());
+        setupDiv.style.display = 'block';
+        roomDiv.style.display = 'none';
+        participantsDiv.innerHTML = '';
+        remoteAudio.innerHTML = '';
+      });
+
+      pttCheckbox.addEventListener('change', (e) => {
+        ptt = e.target.checked;
+        pttState.textContent = 'PTT: ' + (ptt ? 'activé (appuie sur Espace)' : 'désactivé');
+      });
+
+      // push-to-talk global handlers
+      window.addEventListener('keydown', (e) => {
+        if (!ptt) return;
+        if (e.code === 'Space') setLocalMuted(false);
+      });
+      window.addEventListener('keyup', (e) => {
+        if (!ptt) return;
+        if (e.code === 'Space') setLocalMuted(true);
+      });
+
+      // small safety: warn before leaving page
+      window.addEventListener('beforeunload', () => {
+        if (socket) socket.disconnect();
+      });
+
+    })();
+  </script>
+</body>
+</html>
+
